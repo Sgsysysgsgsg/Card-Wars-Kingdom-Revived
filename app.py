@@ -748,6 +748,13 @@ def Blueprints():
 			})
 	return jsonify(data)
 
+#the client in the CardWarsKingdom repo asks for each blueprint on its own
+@app.route("/persist/static/Blueprints/<string:name>", methods=['GET'])
+def BlueprintFile(name):
+	if not re.fullmatch(r"db_\w+\.json", name):
+		abort(404)
+	return send_from_directory("data/persist/blueprints", name, mimetype="application/json")
+
 @app.route("/persist/messages_received_ids")
 def PersistMessagesReceivedIDs():
 	return send_from_directory(directory="", path="data/persist/messages_received_ids.json", as_attachment=True, download_name="messages_received_ids.json")
@@ -977,6 +984,16 @@ def PersistGame():
 	if request.headers.get("Version") is None:
 		DiscordWebhookMessage(username +" attempted to access game without Version header. IP: " + IPFromRequest(request))
 		abort(404)
+	return PersistGameFor(username)
+
+#the client in the CardWarsKingdom repo puts the player id in the path and sends no Player-Id, Platform or Version header
+@app.route("/persist/<string:player_id>/game", methods=['GET', 'PUT'])
+def PersistGameByPath(player_id):
+	if request.headers.get("User-Agent") != "Innertube Explorer v0.1":
+		abort(404)
+	return PersistGameFor(player_id)
+
+def PersistGameFor(username):
 	if request.method == 'PUT':
 		if request.headers.get("X-Nick-Description") is None:
 			DiscordWebhookMessage(username +" attempted to access game without X-Nick-Description header. IP: " + IPFromRequest(request))

@@ -1530,21 +1530,25 @@ def Log(category, message):
 		log = f"{time} - [{category.upper()}] - {message} \n"
 		f.write(log)
 
-if __name__ == '__main__':
-	Log("server", "Starting server...")
- 
-	#create version.txt and android_version.txt if they don't exist
-	if not os.path.exists("data/persist/version.txt"):
-		with open("data/persist/version.txt", "w") as f:
-			f.write("1.0.0")
-	if not os.path.exists("data/persist/android_version.txt"):
-		with open("data/persist/android_version.txt", "w") as f:
-			f.write("1.0.0")
-	
-	app.run(debug=args.debug, port=args.port)
+#everything up to app.run happens on import, so python app.py, flask run and gunicorn all get it:
+#app.run blocks until the server stops, so nothing after it ran while the server was up
+
+#create version.txt and android_version.txt if they don't exist
+if not os.path.exists("data/persist/version.txt"):
+	with open("data/persist/version.txt", "w") as f:
+		f.write("1.0.0")
+if not os.path.exists("data/persist/android_version.txt"):
+	with open("data/persist/android_version.txt", "w") as f:
+		f.write("1.0.0")
 
 with app.app_context():
 	db.create_all()
 
-scheduler_thread = threading.Thread(target=run_scheduler)
-scheduler_thread.start()
+#with --debug the reloader runs this file in two processes; only the one serving requests runs the backups
+if not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+	scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+	scheduler_thread.start()
+
+if __name__ == '__main__':
+	Log("server", "Starting server...")
+	app.run(debug=args.debug, port=args.port)

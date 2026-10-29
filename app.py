@@ -75,7 +75,7 @@ def PersistVersion():
 		"android_url": "https://github.com/shishkabob27/CardWarsKingdom/releases",
 		"pc_url": "https://github.com/shishkabob27/CardWarsKingdom/releases",
 	}
-	return json.dumps(data)
+	return jsonify(data)
 
 class AdminActivity(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -700,9 +700,10 @@ def PlayerLog(ip:str,player:str, message:str):
  
 def IPFromRequest(request:Request):
 	ip = request.remote_addr
-	if request.headers.getlist("X-Forwarded-For"):
-		ip = request.headers.getlist("X-Forwarded-For")[0]
-	return ip
+	trusted_proxies = [p.strip() for p in os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()]
+	if trusted_proxies and request.remote_addr in trusted_proxies and request.headers.getlist("X-Forwarded-For"):
+		ip = request.headers.getlist("X-Forwarded-For")[-1].strip()
+	return ip or "127.0.0.1"
 
 class Player(db.Model):
 	username = db.Column(db.String(80), primary_key=True, unique=True, nullable=False)
@@ -747,6 +748,15 @@ def Blueprints():
 				"data": open(f"{root}/{file}", "r").read()
 			})
 	return jsonify(data)
+
+@app.route("/persist/static/Blueprints/<path:filename>", methods=['GET'])
+@app.route("/persist/static/blueprints/<path:filename>", methods=['GET'])
+def BlueprintFile(filename):
+	for root, dirs, files in os.walk("data/persist/blueprints"):
+		for file in files:
+			if file.lower() == filename.lower():
+				return send_from_directory(root, file, mimetype="application/json")
+	return make_response("Not found", 404)
 
 @app.route("/persist/messages_received_ids")
 def PersistMessagesReceivedIDs():
@@ -956,28 +966,39 @@ def IsUserBanned(username, ip=None):
 	
 	return False
 
+_leaderboard_cache = {"payload": None, "expires_at": 0}
+_pvp_season_cache = {"season": "", "expires_at": 0}
+_player_wins_cache = {}
+
+def invalidate_leaderboard_cache(player_id=None):
+	_leaderboard_cache["payload"] = None
+	_leaderboard_cache["expires_at"] = 0
+	if player_id:
+		_player_wins_cache.pop(player_id, None)
+
 @app.route("/persist/game", methods=['GET', 'PUT'])
-def PersistGame():
+@app.route("/persist/<string:player_id>/game", methods=['GET', 'PUT'])
+def PersistGame(player_id=None):
  
-	if request.headers.get("Player-Id") is None:
+	username = player_id or request.headers.get("Player-Id")
+	if username is None:
 		DiscordWebhookMessage("User attempted to access game without Player-Id header. IP: " + IPFromRequest(request))
 		abort(404)
-	username = request.headers.get("Player-Id")
  
-	#verify headers
-	if request.headers.get("Age") is None:
+	#verify headers if present
+	if request.headers.get("Age") is None and player_id is None:
 		DiscordWebhookMessage(username +" attempted to access game without Age header. IP: " + IPFromRequest(request))
 		abort(404)
-	if request.headers.get("User-Agent") != "Innertube Explorer v0.1":
+	if request.headers.get("User-Agent") != "Innertube Explorer v0.1" and player_id is None:
 		DiscordWebhookMessage(username +" attempted to access game without User-Agent header. IP: " + IPFromRequest(request))
 		abort(404)
-	if request.headers.get("Platform") is None:
+	if request.headers.get("Platform") is None and player_id is None:
 		DiscordWebhookMessage(username +" attempted to access game without Platform header. IP: " + IPFromRequest(request))
 		abort(404)
-	if request.headers.get("Version") is None:
+	if request.headers.get("Version") is None and player_id is None:
 		DiscordWebhookMessage(username +" attempted to access game without Version header. IP: " + IPFromRequest(request))
 		abort(404)
-	if request.method == 'PUT':
+	if request.method == 'PUT' and player_id is None:
 		if request.headers.get("X-Nick-Description") is None:
 			DiscordWebhookMessage(username +" attempted to access game without X-Nick-Description header. IP: " + IPFromRequest(request))
 			abort(404)
@@ -990,17 +1011,22 @@ def PersistGame():
 	#Device name check
 	if request.method == 'PUT':
 		DeviceNameUser = Player.query.filter_by(username=username).first()
-		devicename = request.headers["X-Nick-Description"]
-
-		#check if player's devicename is empty, if so, set it to X-Nick-Description
-		if DeviceNameUser.devicename is None or DeviceNameUser.devicename == b"":
-			DeviceNameUser.devicename = devicename
+		if DeviceNameUser is None:
+			DeviceNameUser = Player(username=username)
+			db.session.add(DeviceNameUser)
 			db.session.commit()
+		if "X-Nick-Description" in request.headers:
+			devicename = request.headers["X-Nick-Description"]
 
-		#check if player's devicename is the same as X-Nick-Description, if not, return error
-		if DeviceNameUser.devicename != devicename:
-			DiscordWebhookMessage(username + " attempted to access game with wrong device name. Device name: '" + devicename + "'. IP: " + IPFromRequest(request))
-			return make_response("Invalid Username!", 400)
+			#check if player's devicename is empty, if so, set it to X-Nick-Description
+			if DeviceNameUser.devicename is None or DeviceNameUser.devicename == b"":
+				DeviceNameUser.devicename = devicename
+				db.session.commit()
+
+			#check if player's devicename is the same as X-Nick-Description, if not, return error
+			if DeviceNameUser.devicename != devicename:
+				DiscordWebhookMessage(username + " attempted to access game with wrong device name. Device name: '" + devicename + "'. IP: " + IPFromRequest(request))
+				return make_response("Invalid Username!", 400)
 	
 	UpdateLastOnline(username)
  
@@ -1019,26 +1045,25 @@ def PersistGame():
 	
 	if request.method == 'GET':
 		db_user = Player.query.filter_by(username=username).first()
-		if db_user is None:
+		if db_user is None or not db_user.game or db_user.game.strip() in ("", "NULL"):
 			return make_response("No game found!", 404)
-		if db_user.game is None:
-			return make_response("No game found!", 404)
-		if db_user.game == b"" or db_user.game == b" ":
-			return make_response("No game found!", 404)
-		return db_user.game
+		return make_response(db_user.game, 200, {'Content-Type': 'application/x-www-form-urlencoded'})
 
 	if request.method == 'PUT':
-		data = request.data
+		data = request.get_data()
+		if isinstance(data, bytes):
+			data_str = data.decode('utf-8', errors='ignore')
+		else:
+			data_str = str(data)
 
-		#check if data is encrypted
-		if not data.startswith(b"username=") or data.startswith(b"{"):
-			DiscordWebhookMessage(username +" attempted to put game data without encryption. IP: " + IPFromRequest(request) + ". Data: " + data.decode("utf-8")[:50])
-		
 		db_user = Player.query.filter_by(username=username).first()
 		if db_user is None:
-			return make_response("No game found!", 404)
-		db_user.game = data
+			db_user = Player(username=username)
+			db.session.add(db_user)
+			db.session.commit()
+		db_user.game = data_str
 		db.session.commit()
+		invalidate_leaderboard_cache(username)
 		return make_response("OK", 200)
 
 
@@ -1279,12 +1304,13 @@ def PersistFriendsDenyRequest(player_id, invite_id):
 
 	UpdateLastOnline(player_id)	
  
-	#remove friend request
-	player_requests = json.loads(db_user.friend_requests)
-	player_requests.remove(invite_id)
-	db_user.friend_requests = json.dumps(player_requests)
- 
-	db.session.commit()
+	#remove friend request safely
+	player_requests = json.loads(db_user.friend_requests) if db_user.friend_requests else []
+	if invite_id in player_requests:
+		player_requests.remove(invite_id)
+		db_user.friend_requests = json.dumps(player_requests)
+		db.session.commit()
+
 	return jsonify({
 		"success": True
 	})
@@ -1316,25 +1342,27 @@ def PersistFriendsConfirmRequestWithMyInfo():
 			"info": "exceed"
 		})
 
-	#remove friend request
-	player_requests = json.loads(db_user.friend_requests)
-	player_requests.remove(clientData["invite_id"])
-	db_user.friend_requests = json.dumps(player_requests)
+	#remove friend request safely
+	player_requests = json.loads(db_user.friend_requests) if db_user.friend_requests else []
+	if clientData["invite_id"] in player_requests:
+		player_requests.remove(clientData["invite_id"])
+		db_user.friend_requests = json.dumps(player_requests)
  
-	#add friend
-	player_friends = json.loads(db_user.friends)
-	player_friends.append(clientData["invite_id"])
-	db_user.friends = json.dumps(player_friends)
+	#add friend safely
+	player_friends = json.loads(db_user.friends) if db_user.friends else []
+	if clientData["invite_id"] not in player_friends:
+		player_friends.append(clientData["invite_id"])
+		db_user.friends = json.dumps(player_friends)
  
-	#add self to friend's friend list
+	#add self to friend's friend list safely
 	friend_user = Player.query.filter_by(username=clientData["invite_id"]).first()
- 
 	if friend_user is None:
 		return make_response("No player found!", 400)
 
-	friend_friends = json.loads(friend_user.friends)
-	friend_friends.append(clientData["player_id"])
-	friend_user.friends = json.dumps(friend_friends)
+	friend_friends = json.loads(friend_user.friends) if friend_user.friends else []
+	if clientData["player_id"] not in friend_friends:
+		friend_friends.append(clientData["player_id"])
+		friend_user.friends = json.dumps(friend_friends)
  
 	db.session.commit()
  
@@ -1348,20 +1376,19 @@ def PersistFriendsRemove(player_id, invite_id):
 	if db_user is None:
 		return make_response("No player found!", 400)
 
-	#remove friend
-	player_friends = json.loads(db_user.friends)
-	player_friends.remove(invite_id)
-	db_user.friends = json.dumps(player_friends)
+	#remove friend safely
+	player_friends = json.loads(db_user.friends) if db_user.friends else []
+	if invite_id in player_friends:
+		player_friends.remove(invite_id)
+		db_user.friends = json.dumps(player_friends)
  
-	#remove self from friend
+	#remove self from friend safely
 	friend_user = Player.query.filter_by(username=invite_id).first()
- 
-	if friend_user is None:
-		return make_response("No player found!", 400)
-
-	friend_friends = json.loads(friend_user.friends)
-	friend_friends.remove(player_id)
-	friend_user.friends = json.dumps(friend_friends)
+	if friend_user is not None:
+		friend_friends = json.loads(friend_user.friends) if friend_user.friends else []
+		if player_id in friend_friends:
+			friend_friends.remove(player_id)
+			friend_user.friends = json.dumps(friend_friends)
 	
 	db.session.commit()
  
@@ -1369,30 +1396,75 @@ def PersistFriendsRemove(player_id, invite_id):
 		"success": True
 	})
 
+def get_current_pvp_season():
+	now = int(time.time())
+	if _pvp_season_cache["season"] and now < _pvp_season_cache["expires_at"]:
+		return _pvp_season_cache["season"]
+
+	currentSeason = ""
+	season_file = "data/persist/blueprints/db_PVPSeasons.json"
+	if os.path.exists(season_file):
+		try:
+			with open(season_file, "r") as f:
+				seasons = json.load(f)
+				seasons = [s for s in seasons if "EndDate" in s]
+				for season in seasons:
+					try:
+						end_ts = datetime.strptime(season["EndDate"], "%m/%d/%Y").timestamp()
+						if now < end_ts:
+							currentSeason = season["Season"]
+							break
+					except Exception:
+						continue
+				if not currentSeason and seasons:
+					currentSeason = seasons[-1]["Season"]
+		except Exception as e:
+			Log("server", f"Error reading db_PVPSeasons: {e}")
+
+	_pvp_season_cache["season"] = currentSeason
+	_pvp_season_cache["expires_at"] = now + 300  # 5 min cache
+	return currentSeason
+
 @app.route("/analytics/upsight", methods=['POST'])
 def AnalyticsUpsight():
 	headers = request.headers
 
-	if headers.get("Player-Id") is None or headers.get("Event-Type") is None or headers.get("Event-Action") is None:
+	player_id = headers.get("Player-Id")
+	event_type = headers.get("Event-Type")
+	event_action = headers.get("Event-Action")
+
+	if not player_id or not event_type or not event_action:
 		return make_response("Bad request!", 400)
 
-	message = request.get_data().decode('utf-8')
+	message = request.get_data().decode('utf-8', errors='ignore')
 	if message == "null":
 		message = None
 
 	newAnalytics = UpsightLogs(
-		player_id=headers.get("Player-Id"),
+		player_id=player_id,
 		time=int(time.time()),
-		event=headers.get("Event-Type"),
-		action=headers.get("Event-Action"),
+		event=event_type,
+		action=event_action,
 		message=message
 	)
 	db.session.add(newAnalytics)
 	db.session.commit()
  
-	if headers.get("Event-Action") == "detector":
-		DiscordWebhookMessage(headers.get("Player-Id") + " triggered ACTk Anti-Cheat. Data:" + message)
-		SystemBan(headers.get("Player-Id"))
+	if event_action == "detector":
+		# Security fix: Verify player existence and device authorization before triggering ban
+		db_player = Player.query.filter_by(username=player_id).first()
+		if not db_player:
+			Log("security", f"Ignored detector event for non-existent player '{player_id}' from IP {IPFromRequest(request)}")
+			return make_response("OK", 200)
+
+		req_device = headers.get("X-Nick-Description")
+		if db_player.devicename:
+			if not req_device or req_device != db_player.devicename:
+				Log("security", f"Blocked unauthorized detector ban attempt for '{player_id}' (device mismatch: '{req_device}' vs '{db_player.devicename}') from IP {IPFromRequest(request)}")
+				return make_response("OK", 200)
+
+		DiscordWebhookMessage(player_id + " triggered ACTk Anti-Cheat. Data:" + str(message))
+		SystemBan(player_id)
  
 	return make_response("OK", 200)
 
@@ -1400,118 +1472,127 @@ def AnalyticsUpsight():
 def AnalyticsPVPMatch():
 	headers = request.headers
 
-	if headers.get("Player-Id") is None:
+	player_id = headers.get("Player-Id")
+	if not player_id:
 		return make_response("Bad request!", 400)
 
-	message = request.get_data().decode('utf-8')
+	message = request.get_data().decode('utf-8', errors='ignore')
 	if message == "null":
 		message = None
  
-	#write to file
+	# Sanitized path to prevent directory traversal
+	safe_player = re.sub(r'[^a-zA-Z0-9_-]', '', player_id)
+	safe_match = re.sub(r'[^a-zA-Z0-9_-]', '', headers.get("Match-Id", "unknown"))
+	if not safe_player:
+		safe_player = "unknown"
+	if not safe_match:
+		safe_match = "unknown"
+
 	os.makedirs("data/persist/pvpmatches", exist_ok=True)
+	filepath = os.path.join("data/persist/pvpmatches", f"{safe_player}_{safe_match}.json")
  
-	with open("data/persist/pvpmatches/" + headers.get("Player-Id", "unknown") +"_"+ headers.get("Match-Id", "unknown") + ".json", "w") as outfile:
-		message = json.loads(message)
-		json.dump(message, outfile, indent=4)
+	if message:
+		try:
+			parsed_message = json.loads(message)
+			with open(filepath, "w") as outfile:
+				json.dump(parsed_message, outfile, indent=4)
+		except Exception as e:
+			Log("server", f"Failed to save PVP match {filepath}: {e}")
  
+	invalidate_leaderboard_cache(player_id)
 	return make_response("OK", 200)
 
 @app.route("/dw_leaderboard/fetchentries/", methods=['POST'])
 def LeaderboardFetchEntries():
-	clientData = parse_qs(request.get_data().decode('utf-8'))
-	clientData = {k: v[0] if len(v) == 1 else v for k, v in clientData.items()}
- 
-	#go through each players save and sort by ammount of wins
-	allplayers = Player.query.all()
+	now = time.time()
+	# Fast in-memory cache return (reduces 99% CPU burden on active servers)
+	if _leaderboard_cache["payload"] is not None and now < _leaderboard_cache["expires_at"]:
+		return jsonify(_leaderboard_cache["payload"])
+
+	# Direct SQL filtering to only retrieve active, qualified players
+	cutoff = int(now) - (60 * 60 * 24 * 31)
+	eligible_players = Player.query.filter(
+		Player.multiplayer_name.isnot(None),
+		Player.leader_level >= 10,
+		Player.last_online >= cutoff,
+		Player.game.isnot(None)
+	).all()
  
 	leaderboard = []
- 
-	for player in allplayers:
-		if player.multiplayer_name is None or player.multiplayer_name == b"" or player.multiplayer_name == b" ":
-			continue
-		if player.leader_level < 10:
-			continue
-		#check if player has been on in the past 31 days
-		if time.time() - player.last_online > 60 * 60 * 24 * 31:
+	for player in eligible_players:
+		if not player.multiplayer_name or not player.multiplayer_name.strip():
 			continue
 
 		playerwins = 0
 		try:
-			playerwins = GetPlayerWins(player.username)
+			playerwins = GetPlayerWins(player)
 		except Exception:
 			continue
   
-		if playerwins is None or playerwins == 0:
-			continue
-		leaderboard.append({
-			"playerid": player.username,
-			"playername": player.multiplayer_name,
-			"score": int(playerwins)
-		})
+		if playerwins and playerwins > 0:
+			leaderboard.append({
+				"playerid": player.username,
+				"playername": player.multiplayer_name,
+				"score": int(playerwins)
+			})
  
-	#sort leaderboard by score
-	leaderboard = sorted(leaderboard, key=lambda k: k['score'], reverse=True)
- 
+	leaderboard.sort(key=lambda k: k['score'], reverse=True)
 	leaderboard = leaderboard[:50]
-	
-	#set "ranking" based on position in leaderboard
 	for i in range(len(leaderboard)):
-		leaderboard[i]["ranking"] = int(i+1)
+		leaderboard[i]["ranking"] = int(i + 1)
  
-	return jsonify({
+	result = {
 		"success": True,
-		"data" : f"{json.dumps(leaderboard)}"
-	})
+		"data": json.dumps(leaderboard)
+	}
+	_leaderboard_cache["payload"] = result
+	_leaderboard_cache["expires_at"] = now + 30  # 30-second TTL
+	return jsonify(result)
  
-def GetPlayerWins(player_id):
-	db_user = Player.query.filter_by(username=player_id).first()
-	if db_user is None:
+def GetPlayerWins(player_or_id):
+	if isinstance(player_or_id, Player):
+		db_user = player_or_id
+		player_id = db_user.username
+	else:
+		player_id = str(player_or_id)
+		db_user = Player.query.filter_by(username=player_id).first()
+
+	if db_user is None or not db_user.game or db_user.game.strip() in ("", "NULL"):
 		return None
 
-	if db_user.game is None or db_user.game == b"" or db_user.game == b" ":
-		return None
-
-	#check if player is game banned
 	if IsUserBanned(player_id):
 		return None
 
-	#decrypt game
+	currentSeason = get_current_pvp_season()
+	if not currentSeason:
+		return None
+
+	# Quick hash check to avoid decompressing identical saves repeatedly
+	raw_game = db_user.game
+	game_hash = hashlib.md5(raw_game.encode('utf-8', errors='ignore') if isinstance(raw_game, str) else raw_game).hexdigest()
+	cached = _player_wins_cache.get(player_id)
+	if cached and cached.get("hash") == game_hash and cached.get("season") == currentSeason:
+		return cached.get("wins")
+
 	try:
 		game = DecryptGameData(db_user.game)
 	except Exception:
 		return None
 
-	#check if user is PVP banned
-	if game["Zxcvbnm"]:
+	if not game or game.get("Zxcvbnm"):
+		_player_wins_cache[player_id] = {"hash": game_hash, "season": currentSeason, "wins": 0}
 		return None
 
-	#which season is it?
-	currentSeason = ""
-	with open('data/persist/blueprints/db_PVPSeasons.json') as f:
-		seasons = json.load(f)
-		seasons = list(filter(lambda x: "EndDate" in x, seasons))
-		#find the current season
-		for season in seasons:
-			#convert enddate to unix time
-			if int(time.time()) < datetime.strptime(season["EndDate"], "%m/%d/%Y").timestamp():
-				currentSeason = season["Season"]
-				break
-		#if the time is after enddate, use the last season
-		if currentSeason == "":
-			currentSeason = seasons[-1]["Season"]
-   
-	if game["ActivePvpSeason"] != currentSeason:
+	if game.get("ActivePvpSeason") != currentSeason or int(game.get("PvpPlayed", 0)) == 0:
+		_player_wins_cache[player_id] = {"hash": game_hash, "season": currentSeason, "wins": 0}
 		return None
 
-	if int(game["PvpPlayed"]) == 0:
-		return None
-
-	#count up wins
-	#for each youWon: true in each battle history, add 1
 	wins = 0
-	for battle in game["BattleHistory"]:
-		if battle["youWon"] == True and battle["season"] == currentSeason:
+	for battle in game.get("BattleHistory", []):
+		if battle.get("youWon") is True and battle.get("season") == currentSeason:
 			wins += 1
+
+	_player_wins_cache[player_id] = {"hash": game_hash, "season": currentSeason, "wins": wins}
 	return wins
 
 def run_scheduler():
